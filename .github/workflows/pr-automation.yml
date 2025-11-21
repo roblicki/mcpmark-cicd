@@ -1,0 +1,364 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+      - name: Install dependencies
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+      - name: Run ESLint and Prettier checks (collect results)
+        id: collect_code_quality
+        run: |
+          set +e
+          mkdir -p reports
+
+          # ESLint
+          HAS_LINT=$(node -e "try{const s=require('./package.json').scripts||{};process.stdout.write(s.lint?'yes':'no')}catch(e){process.stdout.write('no')}")
+          ESLINT_STATUS="SKIPPED"
+          if [ "$HAS_LINT" = "yes" ]; then
+            npm run lint --silent > reports/eslint.txt 2>&1
+            ESLINT_EXIT=$?
+            if [ $ESLINT_EXIT -eq 0 ]; then ESLINT_STATUS="PASS"; else ESLINT_STATUS="FAIL"; fi
+          else
+            if npx --yes eslint -v > /dev/null 2>&1; then
+              npx eslint . > reports/eslint.txt 2>&1
+              ESLINT_EXIT=$?
+              if [ $ESLINT_EXIT -eq 0 ]; then ESLINT_STATUS="PASS"; else ESLINT_STATUS="FAIL"; fi
+            else
+              echo "ESLint not available; skipping ESLint check." > reports/eslint.txt
+              ESLINT_STATUS="SKIPPED"
+            fi
+          fi
+
+          # Prettier
+          PRETTIER_STATUS="SKIPPED"
+          if npx --yes prettier --version > /dev/null 2>&1; then
+            npx prettier --check . > reports/prettier.txt 2>&1
+            PRETTIER_EXIT=$?
+            if [ ${PRETTIER_EXIT:-0} -eq 0 ]; then PRETTIER_STATUS="PASS"; else PRETTIER_STATUS="FAIL"; fi
+          else
+            echo "Prettier not available; skipping Prettier check." > reports/prettier.txt
+            PRETTIER_STATUS="SKIPPED"
+          fi
+
+          # Summarize
+          echo "ESLINT_STATUS=$ESLINT_STATUS" >> $GITHUB_ENV
+          echo "PRETTIER_STATUS=$PRETTIER_STATUS" >> $GITHUB_ENV
+
+          {
+            echo "## Code Quality Report";
+            echo "";
+            echo "### ESLint";
+            echo "Status: $ESLINT_STATUS";
+            echo "";
+            echo '\`\`\`';
+            tail -n 200 reports/eslint.txt || true;
+            echo '\`\`\`';
+            echo "";
+            echo "### Prettier";
+            echo "Status: $PRETTIER_STATUS";
+            echo "";
+            echo '\`\`\`';
+            tail -n 200 reports/prettier.txt || true;
+            echo '\`\`\`';
+          } > reports/code-quality.md
+
+          # Never fail the job due to lint/format in order to allow PR feedback and parallel checks to complete
+          exit 0
+      - name: Upload code quality artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-reports
+          path: reports/
+      - name: Post Code Quality PR Comment
+        id: comment_code_quality
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issue_number = context.payload.pull_request.number;
+            const body = fs.readFileSync('reports/code-quality.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+      - name: Install dependencies
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+      - name: Run tests with coverage (NYC)
+        id: run_tests
+        run: |
+          set +e
+          mkdir -p coverage reports
+          # Wrap tests with nyc to generate coverage when possible
+          npx --yes nyc -r text-summary -r lcov npm test > reports/tests.txt 2>&1
+          TEST_EXIT=$?
+          # Try to produce text-summary even if tests fail
+          npx --yes nyc report --reporter=text-summary > reports/coverage-summary.txt 2>&1 || true
+          echo "TEST_EXIT=$TEST_EXIT" >> $GITHUB_ENV
+          # Build PR comment
+          {
+            echo "## Test Coverage Report";
+            echo "";
+            if [ -s reports/coverage-summary.txt ]; then
+              cat reports/coverage-summary.txt;
+            else
+              echo "Coverage summary not available. Tests may be missing or did not produce coverage.";
+            fi
+            echo "";
+            echo "\nLast test output (tail):";
+            echo '\`\`\`';
+            tail -n 200 reports/tests.txt || true;
+            echo '\`\`\`';
+          } > reports/test-coverage.md
+          exit 0
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage
+            coverage/lcov.info
+            reports/coverage-summary.txt
+          if-no-files-found: ignore
+      - name: Post Test Coverage PR Comment
+        id: comment_testing_suite
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issue_number = context.payload.pull_request.number;
+            const body = fs.readFileSync('reports/test-coverage.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+      - name: Install dependencies (no scripts)
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            npm ci --ignore-scripts || npm install --ignore-scripts
+          else
+            npm install --ignore-scripts
+          fi
+      - name: Run npm audit
+        id: npm_audit
+        run: |
+          set +e
+          mkdir -p reports
+          npm audit --json --audit-level=low > reports/npm-audit.json 2>&1
+          AUDIT_EXIT=$?
+          TOTAL_VULNS=$(jq -r '.metadata.vulnerabilities | to_entries | map(.value) | add // 0' reports/npm-audit.json 2>/dev/null || echo 0)
+          echo "TOTAL_VULNS=$TOTAL_VULNS" >> $GITHUB_ENV
+          echo "AUDIT_EXIT=$AUDIT_EXIT" >> $GITHUB_ENV
+          exit 0
+      - name: Secrets scan (gitleaks)
+        id: gitleaks_scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        with:
+          args: detect --source . --no-git --redact --report-format json --report-path reports/gitleaks-report.json
+      - name: Summarize security results and comment
+        id: comment_security_scan
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const issue_number = context.payload.pull_request.number;
+            let vulnerabilities = process.env.TOTAL_VULNS || '0';
+            let gitleaksPath = path.join(process.cwd(), 'reports', 'gitleaks-report.json');
+            let secretsCount = 0;
+            try {
+              if (fs.existsSync(gitleaksPath)) {
+                const data = JSON.parse(fs.readFileSync(gitleaksPath, 'utf8'));
+                if (Array.isArray(data)) secretsCount = data.length;
+                else if (data && Array.isArray(data.findings)) secretsCount = data.findings.length;
+              }
+            } catch (e) {
+              secretsCount = 0;
+            }
+            const auditPath = path.join(process.cwd(), 'reports', 'npm-audit.json');
+            let auditSummary = '';
+            try {
+              if (fs.existsSync(auditPath)) {
+                const json = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+                const v = json.metadata && json.metadata.vulnerabilities ? json.metadata.vulnerabilities : {};
+                auditSummary = Object.entries(v).map(([sev, count]) => `${sev}: ${count}`).join(', ');
+              }
+            } catch (e) {}
+            const body = `## Security Scan Report\n\n**Dependencies**\n\nVulnerabilities: ${vulnerabilities}${auditSummary ? ` (${auditSummary})` : ''}\n\n**Secrets**\n\nFindings: ${secretsCount}\n\nDetails are available in workflow logs and artifacts.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/
+          if-no-files-found: ignore
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+      PORT: 3000
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+      - name: Install dependencies
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+      - name: Build application (if available)
+        id: build_app
+        run: |
+          set +e
+          mkdir -p reports
+          BUILD_STATUS="SKIPPED"
+          if node -e "process.exit(require('./package.json').scripts && require('./package.json').scripts.build ? 0 : 1)"; then
+            npm run build > reports/build.txt 2>&1
+            BUILD_EXIT=$?
+            if [ $BUILD_EXIT -eq 0 ]; then BUILD_STATUS="PASS"; else BUILD_STATUS="FAIL"; fi
+          else
+            echo "No build script found; skipping build." > reports/build.txt
+            BUILD_STATUS="SKIPPED"
+          fi
+          echo "BUILD_STATUS=$BUILD_STATUS" >> $GITHUB_ENV
+          exit 0
+      - name: Validate endpoints (best-effort)
+        id: validate_endpoints
+        run: |
+          set +e
+          ENDPOINT_STATUS="SKIPPED"
+          if node -e "process.exit(require('./package.json').scripts && require('./package.json').scripts.start ? 0 : 1)"; then
+            nohup npm run start > reports/startup.txt 2>&1 &
+            PID=$!
+            # Allow app to boot
+            sleep 10
+            HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:${PORT}/ || echo "000")
+            echo "Endpoint returned HTTP ${HTTP_CODE}" > reports/endpoint.txt
+            if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" -lt 500 ]; then ENDPOINT_STATUS="PASS"; else ENDPOINT_STATUS="FAIL"; fi
+            # Stop app
+            kill $PID 2>/dev/null || true
+          else
+            echo "No start script found; skipping endpoint validation." > reports/endpoint.txt
+            ENDPOINT_STATUS="SKIPPED"
+          fi
+          echo "ENDPOINT_STATUS=$ENDPOINT_STATUS" >> $GITHUB_ENV
+          exit 0
+      - name: Create deployment preview artifact
+        run: |
+          set +e
+          if [ -d dist ]; then
+            tar -czf deploy-preview.tar.gz dist
+            echo "Created deploy-preview.tar.gz from dist/" > reports/deploy.txt
+          else
+            echo "No dist/ directory found; skipping deploy preview artifact." > reports/deploy.txt
+          fi
+          exit 0
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-validation-artifacts
+          path: |
+            deploy-preview.tar.gz
+            reports/
+          if-no-files-found: ignore
+      - name: Post Build Validation PR Comment
+        id: comment_build_validation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issue_number = context.payload.pull_request.number;
+            const buildStatus = process.env.BUILD_STATUS || 'SKIPPED';
+            const endpointStatus = process.env.ENDPOINT_STATUS || 'SKIPPED';
+            let buildTail = '';
+            try { buildTail = fs.readFileSync('reports/build.txt','utf8'); } catch (e) {}
+            let endpointTail = '';
+            try { endpointTail = fs.readFileSync('reports/endpoint.txt','utf8'); } catch (e) {}
+            const body = `## Build Validation\n\nBuild: ${buildStatus}\n\nEndpoint: ${endpointStatus}\n\n\nBuild Log (tail):\n\n\`\`\`\n${buildTail?.toString().split('\n').slice(-50).join('\n')}\n\`\`\`\n\nEndpoint Check:\n\n\`\`\`\n${endpointTail}\n\`\`\``;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });
